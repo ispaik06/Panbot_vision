@@ -39,7 +39,7 @@ Panbot_vision/
 
 ## Environment Setup (Conda + pip)
 
-This project is typically used with a Conda environment (commonly named `sam`).  
+This project is typically used with a Conda environment (commonly named `pb_vision`).  
 `environment.yml` is exported so others can reproduce the environment more easily.
 
 ### Create environment
@@ -47,13 +47,13 @@ This project is typically used with a Conda environment (commonly named `sam`).
 ```bash
 cd ~/Panbot_vision
 conda env create -f environment.yml
-conda activate sam
+conda activate pb_vision
 ```
 
 ### Update existing environment
 
 ```bash
-conda activate sam
+conda activate pb_vision
 conda env update -f environment.yml --prune
 ```
 
@@ -126,7 +126,7 @@ yolov8/
 - Convert masks → YOLO segmentation labels:
 
 ```bash
-conda activate sam
+conda activate pb_vision
 python yolov8/scripts/masks_to_yolo_seg.py
 ```
 
