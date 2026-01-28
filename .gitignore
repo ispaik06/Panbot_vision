@@ -1,0 +1,28 @@
+# =========================
+# Large / generated assets
+# =========================
+
+# SAM checkpoints, local models
+model/**
+yolo26n.pt
+
+# Raw / annotated data
+images/**
+masks/**
+videos/**
+raw_datasets/**
+
+# YOLOv8 datasets & training artifacts
+yolov8/dataset/raw/**
+yolov8/dataset/yolo/**
+yolov8/runs/**
+yolov8/weights/**
+
+# ResNet18+GRU runs (raw data)
+resnet18_gru16/data_raw/**
+
+
+# =========================
+# Keep folder structure
+# =========================
+!.gitkeep
