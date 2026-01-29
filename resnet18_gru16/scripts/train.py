@@ -5,11 +5,14 @@
 # - Robust to AppleDouble (._*) and bad/corrupt images (skip unless --strict)
 # - TensorBoard (--tb) and optional W&B (--wandb)
 # - Saves checkpoints: last.pt, best.pt (best by val macro_f1)
+# - ✅ Resume training from checkpoint (--resume)
+# - ✅ Saves/restores AMP scaler state
 # - Evaluates val every epoch + optional test after training (--eval_test)
 
 import argparse
 import csv
 import json
+import os
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -98,7 +101,6 @@ class SequenceIndexDataset(Dataset):
     - frame_* paths are stored RELATIVE to Panbot_vision (recommended).
     - You run this script from Panbot_vision (so base_dir = cwd).
     """
-
     def __init__(
         self,
         index_csv: Path,
@@ -119,6 +121,14 @@ class SequenceIndexDataset(Dataset):
 
         with index_csv.open("r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
+
+            # 헤더가 이상하거나 key가 없을 때 바로 티나게
+            fieldnames = set(reader.fieldnames or [])
+            required = {"label"} | {f"frame_{i:02d}" for i in range(seq_len)}
+            if not required.issubset(fieldnames):
+                missing = sorted(list(required - fieldnames))
+                raise ValueError(f"index csv missing columns: {missing}\nfile={index_csv}")
+
             for r in reader:
                 label = (r.get("label") or "").strip()
                 if label not in LABEL2ID:
@@ -139,7 +149,6 @@ class SequenceIndexDataset(Dataset):
                     if not pp.is_absolute():
                         pp = base_dir / pp  # do NOT resolve(strict=True), avoid crashing on missing
 
-                    # AppleDouble 파일(._*) 제거
                     if skip_appledouble and pp.name.startswith("._"):
                         ok = False
                         break
@@ -165,15 +174,10 @@ class SequenceIndexDataset(Dataset):
         return len(self.rows)
 
     def _load_one(self, p: Path) -> torch.Tensor:
-        # (strict가 아니면) 파일/디코드 문제는 호출자에서 처리
         im = Image.open(p).convert("RGB")
         return self.tf(im)
 
     def __getitem__(self, idx: int):
-        """
-        strict=False이면:
-        - missing/corrupt 이미지가 나오면 같은 worker 안에서 다음 샘플로 "몇 번" 재시도
-        """
         if len(self.rows) == 0:
             raise RuntimeError(f"Empty dataset: {self.index_csv}")
 
@@ -183,24 +187,19 @@ class SequenceIndexDataset(Dataset):
         while True:
             frame_paths, y = self.rows[cur]
             imgs: List[torch.Tensor] = []
-
             try:
                 for p in frame_paths:
                     if self.skip_appledouble and p.name.startswith("._"):
                         raise FileNotFoundError(f"AppleDouble file: {p}")
                     imgs.append(self._load_one(p))
-
                 x = torch.stack(imgs, dim=0)  # (T,C,H,W)
                 return x, torch.tensor(y, dtype=torch.long)
-
             except (FileNotFoundError, UnidentifiedImageError, OSError) as e:
                 if self.strict:
                     raise
-                # retry next sample
                 tries += 1
                 cur = (cur + 1) % len(self.rows)
                 if tries >= 20:
-                    # 너무 많이 실패하면 원인 드러내기
                     raise RuntimeError(f"Too many bad samples while fetching. Last error: {e}")
 
 
@@ -213,7 +212,6 @@ class ResNet18GRU(nn.Module):
         weights = ResNet18_Weights.DEFAULT if pretrained else None
         backbone = resnet18(weights=weights)
 
-        # remove final FC
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])  # -> (B,512,1,1)
         self.feat_dim = 512
 
@@ -231,7 +229,6 @@ class ResNet18GRU(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B,T,C,H,W)
         B, T, C, H, W = x.shape
         x = x.reshape(B * T, C, H, W)
         feat = self.backbone(x).flatten(1)   # (B*T,512)
@@ -309,6 +306,54 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def save_ckpt(
+    path: Path,
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: Optional[torch.amp.GradScaler],
+    best_macro_f1: float,
+    args: dict,
+):
+    ckpt = {
+        "epoch": int(epoch),
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "best_macro_f1": float(best_macro_f1),
+        "label2id": LABEL2ID,
+        "args": args,
+    }
+    if scaler is not None:
+        ckpt["scaler"] = scaler.state_dict()
+    torch.save(ckpt, path)
+
+
+def load_ckpt(
+    path: Path,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scaler: Optional[torch.amp.GradScaler],
+    device: torch.device,
+):
+    ckpt = torch.load(path, map_location=device)
+
+    model.load_state_dict(ckpt["model"], strict=True)
+
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    if scaler is not None and "scaler" in ckpt:
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception as e:
+            print(f"[RESUME] scaler state load failed (ignored): {e}")
+
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best_macro_f1 = float(ckpt.get("best_macro_f1", -1.0))
+
+    return start_epoch, best_macro_f1, ckpt
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -350,6 +395,11 @@ def main():
 
     # eval
     ap.add_argument("--eval_test", action="store_true", help="evaluate test set after training (uses best.pt)")
+
+    # ✅ resume
+    ap.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt to resume (e.g., runs/.../last.pt)")
+    ap.add_argument("--resume_strict_args", action="store_true",
+                    help="If set, checks that key training args match checkpoint (seq_len/image_size/hidden/gru_layers/labels).")
 
     args = ap.parse_args()
 
@@ -402,13 +452,29 @@ def main():
     print("[DATA] train:", len(ds_train), "val:", len(ds_val))
 
     pin = (device.type == "cuda")
+
+    # num_workers 세팅이 크면 hang/느려질 수 있어서 안전 옵션 몇 개 추가
+    # (특히 외장 SSD + 많은 workers에서 유용)
+    persistent = (args.num_workers > 0)
+
     dl_train = DataLoader(
-        ds_train, batch_size=args.batch, shuffle=True,
-        num_workers=args.num_workers, pin_memory=pin, drop_last=True
+        ds_train,
+        batch_size=args.batch,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        drop_last=True,
+        persistent_workers=persistent,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     dl_val = DataLoader(
-        ds_val, batch_size=args.batch, shuffle=False,
-        num_workers=args.num_workers, pin_memory=pin
+        ds_val,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin,
+        persistent_workers=persistent,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # model
@@ -418,9 +484,6 @@ def main():
         num_classes=len(LABELS),
         pretrained=(not args.no_pretrained),
     ).to(device)
-
-    # NOTE: pretrained ResNet weights are auto-downloaded by torchvision if not cached.
-    # If your machine has no internet, you may need to cache them once or use --no_pretrained.
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -432,8 +495,35 @@ def main():
     best_path = out_dir / "best.pt"
     last_path = out_dir / "last.pt"
 
+    start_epoch = 1
+
+    # ✅ resume logic
+    if args.resume.strip():
+        resume_path = Path(args.resume).expanduser()
+        if not resume_path.is_absolute():
+            resume_path = (out_dir / resume_path).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume not found: {resume_path}")
+
+        print("[RESUME] loading:", resume_path)
+        start_epoch, best_macro_f1, ckpt = load_ckpt(resume_path, model, optimizer, scaler, device)
+
+        # optional arg consistency check
+        if args.resume_strict_args:
+            ck_args = ckpt.get("args", {}) or {}
+            def _eq(k):
+                return str(ck_args.get(k)) == str(getattr(args, k))
+            critical = ["seq_len", "image_size", "hidden", "gru_layers"]
+            bad = [k for k in critical if not _eq(k)]
+            if bad:
+                raise RuntimeError(f"[RESUME] args mismatch for {bad}.\n"
+                                   f"ckpt args={ {k: ck_args.get(k) for k in bad} }\n"
+                                   f"now args ={ {k: getattr(args,k) for k in bad} }")
+
+        print(f"[RESUME] start_epoch={start_epoch}  best_macro_f1={best_macro_f1:.3f}")
+
     # training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         tr_loss, tr_cm, tr_m = run_one_epoch(
             model, dl_train, optimizer, device, scaler, train=True, log_every=args.log_every
         )
@@ -485,19 +575,29 @@ def main():
             log_dict["val/confusion_matrix"] = wandb.Image(cm_to_rgb_image(va_cm))
             wandb.log(log_dict)
 
-        # save ckpt
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "label2id": LABEL2ID,
-            "args": vars(args),
-        }
-        torch.save(ckpt, last_path)
+        # save ckpt (last)
+        save_ckpt(
+            last_path,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            best_macro_f1=best_macro_f1,
+            args=vars(args),
+        )
 
+        # save best (by val macro_f1)
         if float(va_m["macro_f1"]) > best_macro_f1:
             best_macro_f1 = float(va_m["macro_f1"])
-            torch.save(ckpt, best_path)
+            save_ckpt(
+                best_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                best_macro_f1=best_macro_f1,
+                args=vars(args),
+            )
             print(f"  [SAVE] best -> {best_path} (macro_f1={best_macro_f1:.3f})")
 
     # close writers
@@ -515,11 +615,15 @@ def main():
         print("\n[TEST] evaluating best.pt on test set:", test_csv)
         ds_test = SequenceIndexDataset(test_csv, base_dir=base_dir, seq_len=args.seq_len, image_size=args.image_size, strict=args.strict)
         dl_test = DataLoader(
-            ds_test, batch_size=args.batch, shuffle=False,
-            num_workers=args.num_workers, pin_memory=pin
+            ds_test,
+            batch_size=args.batch,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin,
+            persistent_workers=persistent,
+            prefetch_factor=2 if args.num_workers > 0 else None,
         )
 
-        # load best
         best = torch.load(best_path, map_location=device)
         model.load_state_dict(best["model"])
         model.eval()
@@ -533,7 +637,6 @@ def main():
             print(f"  - {name:12s}  P={te_m['precision'][i]:.3f} R={te_m['recall'][i]:.3f} "
                   f"F1={te_m['f1'][i]:.3f}  FP={int(te_m['fp'][i])} FN={int(te_m['fn'][i])}")
 
-        # write test metrics to file
         metrics_path = out_dir / "test_metrics.json"
         out = {
             "test_loss": float(te_loss),
