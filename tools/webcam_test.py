@@ -1,7 +1,7 @@
 import cv2
 
 def main():
-    cam_index = 4
+    cam_index = 2
 
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
